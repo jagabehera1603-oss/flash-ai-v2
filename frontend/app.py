@@ -1,5 +1,6 @@
-import os, re, requests
-from urllib.parse import urlparse
+import os, re, html
+import requests
+from urllib.parse import urlparse, quote_plus
 import streamlit as st
 
 st.set_page_config(page_title='Jagadish_webscraping', page_icon='🔎', layout='wide')
@@ -42,11 +43,19 @@ def money(text):
     return min((float(v.replace(',', '')) for v in vals), default=None)
 
 
+def clean_text(text):
+    text = html.unescape(text or '')
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
 def tavily_headers():
     return {'Authorization': f'Bearer {tavily_key}', 'Content-Type': 'application/json'}
 
 
 def tavily_search(query, max_results=8):
+    if not tavily_key:
+        return []
     r = requests.post('https://api.tavily.com/search', headers=tavily_headers(), json={
         'query': query, 'search_depth': 'advanced', 'max_results': max_results, 'include_answer': True
     }, timeout=45)
@@ -55,6 +64,8 @@ def tavily_search(query, max_results=8):
 
 
 def tavily_extract(url):
+    if not tavily_key:
+        return None
     r = requests.post('https://api.tavily.com/extract', headers=tavily_headers(), json={
         'urls': [url], 'extract_depth': 'basic', 'format': 'markdown'
     }, timeout=60)
@@ -63,11 +74,54 @@ def tavily_extract(url):
     return results[0] if results else None
 
 
+def jina_extract(url):
+    """Key-free page extraction fallback. Useful when retailer extraction is blocked."""
+    r = requests.get('https://r.jina.ai/' + url, headers={'User-Agent': 'Jagadish_webscraping/1.0'}, timeout=60)
+    r.raise_for_status()
+    text = clean_text(r.text)
+    return {'title': urlparse(url).netloc, 'url': url, 'content': text[:12000]}
+
+
+def ddg_search(query, max_results=8):
+    """Key-free search fallback using DuckDuckGo's HTML results page."""
+    url = 'https://html.duckduckgo.com/html/?q=' + quote_plus(query)
+    r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
+    r.raise_for_status()
+    page = r.text
+    results = []
+    # DDG's HTML result blocks are deliberately parsed without extra packages.
+    blocks = re.findall(r'<div[^>]+class="result results_links results_links_deep web-result".*?</div>\s*</div>', page, re.I | re.S)
+    if not blocks:
+        blocks = re.findall(r'<div[^>]+class="result[^>]*".*?</div>\s*</div>', page, re.I | re.S)
+    for block in blocks[:max_results]:
+        link = re.search(r'class="result__a"[^>]*href="([^"]+)"', block, re.I | re.S)
+        title = re.search(r'class="result__a"[^>]*>(.*?)</a>', block, re.I | re.S)
+        snippet = re.search(r'class="result__snippet"[^>]*>(.*?)</a?>', block, re.I | re.S)
+        if not link:
+            continue
+        results.append({
+            'title': clean_text(re.sub('<[^>]+>', ' ', title.group(1))) if title else link.group(1),
+            'url': html.unescape(link.group(1)),
+            'content': clean_text(re.sub('<[^>]+>', ' ', snippet.group(1))) if snippet else ''
+        })
+    return results
+
+
+def web_search(query, max_results=8):
+    """Use Tavily when configured, otherwise a key-free search fallback."""
+    if tavily_key:
+        return tavily_search(query, max_results)
+    try:
+        return ddg_search(query, max_results)
+    except Exception:
+        return []
+
+
 def make_products(sources):
     products, seen = [], set()
     for x in sources:
-        title = x.get('title', '')
-        content = x.get('content', '') or x.get('raw_content', '')
+        title = clean_text(x.get('title', ''))
+        content = clean_text(x.get('content', '') or x.get('raw_content', ''))
         url = x.get('url', '')
         key = (title.lower(), url)
         if key in seen:
@@ -84,9 +138,24 @@ def make_products(sources):
     return products
 
 
+def simple_summary(query, evidence):
+    if not evidence:
+        return 'No readable web evidence was found.'
+    snippets = [clean_text(x.get('content', x.get('raw_content', ''))) for x in evidence]
+    snippets = [x for x in snippets if x]
+    price = next((money(x) for x in snippets if money(x) is not None), None)
+    lines = [f'Research completed for: {query}.', f'Collected {len(evidence)} web source(s).']
+    if price:
+        lines.append(f'Lowest price-like value found in the evidence: ₹{price:,.0f}. Verify the retailer page before purchase.')
+    if snippets:
+        lines.append('Key evidence: ' + snippets[0][:500])
+    lines.append('For deeper AI synthesis, configure OPENAI_API_KEY in Streamlit secrets.')
+    return '\n\n'.join(lines)
+
+
 def ai_summary(query, evidence):
     if not openai_key or not evidence:
-        return 'Web research completed. Add OPENAI_API_KEY to generate the AI synthesis.'
+        return simple_summary(query, evidence)
     text = '\n\n'.join(f"SOURCE: {x.get('title')}\n{x.get('content', x.get('raw_content',''))[:2200]}\nURL: {x.get('url')}" for x in evidence[:10])
     payload = {'model': openai_model, 'messages': [
         {'role': 'system', 'content': 'You are a careful shopping research analyst. Use only supplied evidence. Do not invent specs, prices, ratings, or claims. Distinguish retailer facts from review opinions.'},
@@ -98,58 +167,69 @@ def ai_summary(query, evidence):
 
 
 def research_product_url(url):
-    if not tavily_key:
-        raise RuntimeError('TAVILY_API_KEY is not configured. Add it in Streamlit App Settings → Secrets.')
     host = urlparse(url).netloc.lower()
     asin = amazon_asin(url)
     evidence = []
 
-    # Try the exact product page first. Retailers can block extraction, so failures are non-fatal.
+    # First try the configured extractor. Then use Jina Reader, which needs no API key.
     try:
-        extracted = tavily_extract(url)
+        extracted = tavily_extract(url) if tavily_key else None
         if extracted:
             evidence.append({'title': extracted.get('url', 'Product page'), 'url': extracted.get('url', url),
                              'content': extracted.get('raw_content', '')})
     except Exception:
         pass
+    if not evidence:
+        try:
+            evidence.append(jina_extract(url))
+        except Exception:
+            pass
 
     if asin:
         queries = [
-            f'Amazon India ASIN {asin} product specifications price',
-            f'ASIN {asin} reviews complaints problems',
-            f'"{asin}" laptop review',
+            f'"{asin}" Amazon India product specifications price',
+            f'"{asin}" reviews complaints problems',
+            f'"{asin}" review laptop',
         ]
     else:
         queries = [f'"{url}" product reviews price specifications', f'{host} product reviews complaints']
 
     for query in queries:
         try:
-            evidence.extend(tavily_search(query, max_results=6))
+            evidence.extend(web_search(query, max_results=6))
         except Exception:
             pass
 
     if not evidence:
-        raise RuntimeError('No web evidence was found for this product link. The retailer may be blocking access; try a clean product URL without tracking parameters.')
+        raise RuntimeError('Could not read or find this product. Try the clean product URL (without tracking parameters) or paste the product name.')
 
-    return {'query': url, 'asin': asin, 'summary': ai_summary(url, evidence),
-            'products': make_products(evidence),
-            'sources': [{'title': x.get('title'), 'url': x.get('url'), 'snippet': x.get('content', x.get('raw_content',''))[:350]}
-                        for x in evidence[:20] if x.get('url')]}
+    # Deduplicate URLs while preserving evidence order.
+    unique, seen_urls = [], set()
+    for x in evidence:
+        u = x.get('url', '')
+        if u and u not in seen_urls:
+            seen_urls.add(u)
+            unique.append(x)
+
+    return {'query': url, 'asin': asin, 'summary': ai_summary(url, unique),
+            'products': make_products(unique),
+            'sources': [{'title': x.get('title'), 'url': x.get('url'), 'snippet': clean_text(x.get('content', x.get('raw_content','')))[:350]}
+                        for x in unique[:20] if x.get('url')]}
 
 
 def direct_research(query):
-    if not tavily_key:
-        raise RuntimeError('TAVILY_API_KEY is not configured. Add it in Streamlit App Settings → Secrets.')
-    sources = tavily_search(query + ' India price reviews Amazon Flipkart', max_results=10)
+    sources = web_search(query + ' India price reviews Amazon Flipkart', max_results=10)
+    if not sources:
+        raise RuntimeError('No web results were returned. Please try again.')
     return {'query': query, 'summary': ai_summary(query, sources), 'products': make_products(sources),
-            'sources': [{'title': x.get('title'), 'url': x.get('url'), 'snippet': x.get('content','')[:350]} for x in sources if x.get('url')]}
+            'sources': [{'title': x.get('title'), 'url': x.get('url'), 'snippet': clean_text(x.get('content',''))[:350]} for x in sources if x.get('url')]}
 
 
 if go and q:
     q = q.strip()
     with st.spinner('Researching the product and gathering independent evidence...'):
         try:
-            # URL inputs are handled here instead of calling localhost:8000.
+            # URL inputs never call localhost. This is the production-safe path.
             if is_url(q):
                 data = research_product_url(q)
             elif api:
