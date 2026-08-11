@@ -1,6 +1,6 @@
 import os, requests, streamlit as st
 
-st.set_page_config(page_title='Flash AI', page_icon='⚡', layout='wide')
+st.set_page_config(page_title='Jagadish_webscraping', page_icon='🔎', layout='wide')
 
 st.markdown('''<style>
 .main {max-width: 1180px; margin:auto}
@@ -13,7 +13,7 @@ st.markdown('''<style>
 
 api = st.secrets.get('DJANGO_API_URL', os.getenv('DJANGO_API_URL','http://localhost:8000/api')).rstrip('/')
 
-st.markdown('<div class="hero"><h1>⚡ Flash AI</h1><p>AI-powered product research, review aggregation and comparisons.</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>🔎 Jagadish_webscraping</h1><p>AI-powered product research, review aggregation and comparisons.</p></div>', unsafe_allow_html=True)
 
 q = st.text_input('What are you looking for?', placeholder='Best phone under ₹30,000 for camera and battery')
 col1, col2 = st.columns([1,5])
